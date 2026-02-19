@@ -1,0 +1,16 @@
+# Security / Secrets
+.env
+*.pickle
+.tokens/
+
+# Virtual Environments
+venv/
+env/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Streamlit
+.streamlit/
