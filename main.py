@@ -56,27 +56,32 @@ async def dashboard(request: Request):
     debt_in = sum([row['total'] for row in credit_data if row['type'] in ('Expense', 'Debit')])
     debt_out = sum([row['total'] for row in credit_data if row['type'] in ('Refund', 'Payment', 'Credit')])
     total_debt = debt_in - debt_out
-    # Calculate Portfolio
+    # Calculate Portfolio - fetch each ticker individually for reliable price
     portfolio = conn.execute("SELECT * FROM portfolio").fetchall()
     total_invested = 0.0
     if portfolio:
-        tickers = list(set([row['ticker'] for row in portfolio]))
-        try:
-            live_data = yf.download(tickers, period="1d", progress=False)['Close']
-            for row in portfolio:
-                t = row['ticker']
-                price = float(live_data.iloc[-1]) if len(tickers) == 1 else float(live_data[t].iloc[-1])
+        for row in portfolio:
+            try:
+                data = yf.download(row['ticker'], period="1d", progress=False, auto_adjust=True)
+                if not data.empty and 'Close' in data.columns:
+                    price = float(data['Close'].iloc[-1])
+                else:
+                    info = yf.Ticker(row['ticker']).info
+                    price = info.get('regularMarketPrice') or info.get('previousClose') or row['avg_cost']
                 total_invested += price * row['shares']
-        except:
-            total_invested = sum([row['shares'] * row['avg_cost'] for row in portfolio])
+            except Exception:
+                total_invested += row['shares'] * row['avg_cost']
 
     net_worth = total_cash - total_debt + total_invested
     accounts = conn.execute("SELECT * FROM accounts").fetchall()
     conn.close()
 
+    def fmt(v):
+        return f"{(v if v != 0 else 0):,.2f}"
     return templates.TemplateResponse("dashboard.html", {
-        "request": request, "net_worth": f"{net_worth:,.2f}", "total_cash": f"{total_cash:,.2f}",
-        "total_debt": f"{total_debt:,.2f}", "total_invested": f"{total_invested:,.2f}", "accounts": accounts,
+        "request": request, "net_worth": fmt(net_worth), "total_cash": fmt(total_cash),
+        "total_debt": fmt(total_debt), "total_debt_abs": fmt(abs(total_debt)),
+        "total_invested": fmt(total_invested), "accounts": accounts,
         "net_worth_val": net_worth, "total_cash_val": total_cash, "total_debt_val": total_debt, "total_invested_val": total_invested,
         "chart_history": [net_worth * 0.9, net_worth * 0.95, net_worth * 0.98, net_worth * 1.02, net_worth]
     })
@@ -145,19 +150,61 @@ async def add_holding(brokerage: str = Form(...), ticker: str = Form(...), share
     conn.close()
     return RedirectResponse(url="/portfolio", status_code=303)
 
+@app.post("/portfolio/remove/{holding_id}")
+async def portfolio_remove(holding_id: int):
+    conn = get_db()
+    conn.execute("DELETE FROM portfolio WHERE id=?", (holding_id,))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/portfolio", status_code=303)
+
 # --- PORTFOLIO EMULATOR ---
 @app.get("/emulator", response_class=HTMLResponse)
 async def emulator_page(request: Request):
     conn = get_db()
     holdings = conn.execute("SELECT * FROM emulator_holdings").fetchall()
     conn.close()
-    return templates.TemplateResponse("emulator.html", {"request": request, "holdings": [dict(h) for h in holdings]})
+    return templates.TemplateResponse("emulator.html", {
+        "request": request, "holdings": [dict(h) for h in holdings],
+        "error": request.query_params.get("error", ""),
+        "error_ticker": request.query_params.get("ticker", "")
+    })
+
+def _is_valid_ticker(ticker: str) -> bool:
+    """Verify ticker exists in Yahoo Finance search (catches typos like mfst)."""
+    try:
+        search = yf.Search(ticker)
+        quotes = list(getattr(search, 'quotes', None) or [])
+        valid_symbols = {q.get('symbol', '').upper() for q in quotes if q.get('quoteType') in ('EQUITY', 'ETF', 'MUTUALFUND')}
+        return ticker.upper() in valid_symbols
+    except Exception:
+        return False
 
 @app.post("/emulator/add")
-async def emulator_add(ticker: str = Form(...), shares: float = Form(...), avg_cost: float = Form(...)):
+async def emulator_add(ticker: str = Form(...), shares: float = Form(...), avg_cost: float = Form(default=0.0)):
+    ticker = ticker.upper().strip()
+    if not ticker or len(ticker) < 2:
+        return RedirectResponse(url="/emulator?error=invalid_ticker&ticker=" + ticker, status_code=303)
+    if not _is_valid_ticker(ticker):
+        return RedirectResponse(url="/emulator?error=invalid_ticker&ticker=" + ticker, status_code=303)
+    use_fetched = avg_cost is None or avg_cost <= 0
+    if use_fetched:
+        avg_cost = 0
+        try:
+            data = yf.download(ticker, period="1d", progress=False, auto_adjust=True, threads=False)
+            if not data.empty:
+                last = data['Close'].iloc[-1]
+                avg_cost = round(float(last.squeeze()) if hasattr(last, 'squeeze') else float(last), 2)
+            if avg_cost <= 0:
+                info = yf.Ticker(ticker).info
+                avg_cost = float(info.get('regularMarketPrice') or info.get('previousClose') or 0)
+        except Exception:
+            pass
+    if avg_cost <= 0:
+        return RedirectResponse(url="/emulator?error=invalid_ticker&ticker=" + ticker, status_code=303)
     conn = get_db()
     conn.execute("INSERT INTO emulator_holdings (ticker, shares, avg_cost) VALUES (?, ?, ?)", 
-                 (ticker.upper().strip(), shares, avg_cost))
+                 (ticker, shares, avg_cost))
     conn.commit()
     conn.close()
     return RedirectResponse(url="/emulator", status_code=303)
@@ -166,6 +213,22 @@ async def emulator_add(ticker: str = Form(...), shares: float = Form(...), avg_c
 async def emulator_remove(holding_id: int):
     conn = get_db()
     conn.execute("DELETE FROM emulator_holdings WHERE id=?", (holding_id,))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/emulator", status_code=303)
+
+@app.post("/emulator/sell/{holding_id}")
+async def emulator_sell(holding_id: int, shares: float = Form(...)):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM emulator_holdings WHERE id=?", (holding_id,)).fetchone()
+    if not row:
+        conn.close()
+        return RedirectResponse(url="/emulator", status_code=303)
+    new_shares = row['shares'] - shares
+    if new_shares <= 0:
+        conn.execute("DELETE FROM emulator_holdings WHERE id=?", (holding_id,))
+    else:
+        conn.execute("UPDATE emulator_holdings SET shares=? WHERE id=?", (new_shares, holding_id))
     conn.commit()
     conn.close()
     return RedirectResponse(url="/emulator", status_code=303)
@@ -188,8 +251,44 @@ async def api_emulator_prices():
         except Exception:
             row = next((h for h in holdings if h['ticker'] == t), None)
             result[t] = row['avg_cost'] if row else 0
-    holdings_data = [{"id": h['id'], "ticker": h['ticker'], "shares": h['shares'], "avg_cost": h['avg_cost'], "price": result.get(h['ticker'], h['avg_cost']), "value": round(h['shares'] * result.get(h['ticker'], h['avg_cost']), 2)} for h in holdings]
-    return JSONResponse({"prices": result, "holdings": holdings_data})
+    holdings_data = []
+    for h in holdings:
+        price = result.get(h['ticker'], h['avg_cost'])
+        value = round(h['shares'] * price, 2)
+        cost_basis = round(h['shares'] * h['avg_cost'], 2)
+        gain_loss = round(value - cost_basis, 2)
+        holdings_data.append({
+            "id": h['id'], "ticker": h['ticker'], "shares": h['shares'], "avg_cost": h['avg_cost'],
+            "price": price, "value": value, "cost_basis": cost_basis, "gain_loss": gain_loss
+        })
+    total_value = sum(h["value"] for h in holdings_data)
+    total_cost = sum(h["cost_basis"] for h in holdings_data)
+    total_gain_loss = round(total_value - total_cost, 2)
+    return JSONResponse({"prices": result, "holdings": holdings_data, "total_gain_loss": total_gain_loss})
+
+@app.get("/api/emulator/search")
+async def api_emulator_search(q: str = ""):
+    """Ticker autocomplete - returns symbol, name for dropdown"""
+    q = (q or "").strip()
+    if len(q) < 1:
+        return JSONResponse({"results": []})
+    try:
+        search = yf.Search(q)
+        quotes = list(getattr(search, 'quotes', None) or [])
+        results = []
+        seen = set()
+        for item in quotes[:12]:
+            sym = (item.get('symbol') or '').upper()
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            name = item.get('shortname') or item.get('longname') or sym
+            qt = item.get('quoteType', '')
+            if qt in ('EQUITY', 'ETF', 'MUTUALFUND'):
+                results.append({"symbol": sym, "name": name})
+        return JSONResponse({"results": results[:10]})
+    except Exception:
+        return JSONResponse({"results": []})
 
 @app.get("/api/emulator/history/{ticker}")
 async def api_emulator_history(ticker: str, period: str = "1mo"):

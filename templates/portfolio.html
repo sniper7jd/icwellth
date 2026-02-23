@@ -34,6 +34,7 @@
                         <th class="p-4 font-medium">Ticker</th>
                         <th class="p-4 font-medium">Shares</th>
                         <th class="p-4 font-medium">Cost Basis</th>
+                        <th class="p-4 font-medium">Actions</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-gray-100">
@@ -43,9 +44,14 @@
                         <td class="p-4 font-bold">{{ item['ticker'] }}</td>
                         <td class="p-4">{{ item['shares'] }}</td>
                         <td class="p-4">${{ "{:,.2f}".format(item['avg_cost']) }}</td>
+                        <td class="p-4">
+                            <form action="/portfolio/remove/{{ item['id'] }}" method="POST" class="inline" onsubmit="return confirm('Remove {{ item['ticker'] }}?');">
+                                <button type="submit" class="text-sm text-red-500 hover:text-red-700">Remove</button>
+                            </form>
+                        </td>
                     </tr>
                     {% else %}
-                    <tr><td colspan="4" class="p-8 text-center text-gray-500">No equities added yet.</td></tr>
+                    <tr><td colspan="5" class="p-8 text-center text-gray-500">No equities added yet.</td></tr>
                     {% endfor %}
                 </tbody>
             </table>
