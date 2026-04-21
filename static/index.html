@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WealthManager Expense Dashboard</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div>
+        <h1>Expense Logger & Dashboard</h1>
+        <p class="muted">Offline-ready multi-user finance tracking</p>
+      </div>
+      <div class="topbar-actions">
+        <input id="api-base-input" type="text" placeholder="API base URL">
+        <button id="save-api-btn" class="btn btn-secondary">Save API</button>
+        <button id="logout-btn" class="btn btn-ghost hidden">Logout</button>
+      </div>
+    </header>
+
+    <section id="auth-panel" class="card auth-grid">
+      <div>
+        <h2>Sign In</h2>
+        <form id="login-form" class="stack">
+          <label>Username <input name="username" type="text" required></label>
+          <label>Password <input name="password" type="password" required></label>
+          <button class="btn" type="submit">Login</button>
+        </form>
+      </div>
+      <div>
+        <h2>Register</h2>
+        <form id="register-form" class="stack">
+          <label>Email <input name="email" type="email" required></label>
+          <label>Username <input name="username" type="text" required></label>
+          <label>Password <input name="password" type="password" required></label>
+          <button class="btn btn-secondary" type="submit">Create Account</button>
+        </form>
+      </div>
+      <p id="auth-msg" class="full-row muted"></p>
+    </section>
+
+    <section id="dashboard-panel" class="hidden">
+      <div class="grid-2">
+        <div class="card">
+          <h3>Log New Expense</h3>
+          <form id="expense-form" class="stack">
+            <label>Amount <input name="amount" type="number" step="0.01" min="0.01" required></label>
+            <label>Category
+              <select name="category_id" id="category-select" required></select>
+            </label>
+            <label>Description <input name="description" type="text" maxlength="255" required></label>
+            <label>Date <input name="date" type="date" required></label>
+            <button class="btn" type="submit">Add Expense</button>
+          </form>
+          <p id="expense-msg" class="muted"></p>
+        </div>
+
+        <div class="card">
+          <h3>Monthly Summary</h3>
+          <div class="metric-grid">
+            <div class="metric">
+              <span class="label">Total This Month</span>
+              <span class="value" id="total-month">$0.00</span>
+            </div>
+          </div>
+          <div>
+            <h4>By Category</h4>
+            <div id="category-bars" class="bars"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Recent Expenses</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Category</th>
+              <th>Description</th>
+              <th>Amount</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="expenses-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

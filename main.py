@@ -1,308 +1,311 @@
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
-import sqlite3
-import yfinance as yf
-from datetime import date
-import uvicorn
+import os
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Generator, Optional
 
-app = FastAPI()
-templates = Jinja2Templates(directory="templates")
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
-def get_db():
-    conn = sqlite3.connect("wealth.db", check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+from database import SessionLocal, engine
+from models import Base, Category, Expense, User
 
-def init_db():
-    conn = get_db()
-    conn.execute('''CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY, name TEXT, type TEXT)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY, account_id INTEGER, date TEXT, type TEXT, amount REAL, description TEXT)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS portfolio (id INTEGER PRIMARY KEY, brokerage TEXT, ticker TEXT, shares REAL, avg_cost REAL)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS emulator_holdings (id INTEGER PRIMARY KEY, ticker TEXT, shares REAL, avg_cost REAL)''')
-    conn.commit()
-    conn.close()
 
-init_db()
+SAN_MOUNT_PATH = os.getenv("SAN_MOUNT_PATH")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
+JWT_ALGORITHM = "HS256"
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 
-# --- DASHBOARD ROUTE ---
-@app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
-    conn = get_db()
-    
-    # Calculate Cash
-    # Calculate Cash
-    cash_data = conn.execute('''
-        SELECT transactions.type, SUM(transactions.amount) as total 
-        FROM transactions 
-        JOIN accounts ON transactions.account_id = accounts.id 
-        WHERE accounts.type = 'Bank Account' 
-        GROUP BY transactions.type
-    ''').fetchall()
-    
-    # Bank: Debit adds, Credit subtracts (also legacy Deposit/Withdrawal)
-    bank_in = sum([row['total'] for row in cash_data if row['type'] in ('Debit', 'Deposit')])
-    bank_out = sum([row['total'] for row in cash_data if row['type'] in ('Credit', 'Withdrawal')])
-    total_cash = bank_in - bank_out
+if not SAN_MOUNT_PATH:
+    raise RuntimeError("SAN_MOUNT_PATH environment variable is required.")
+if not JWT_SECRET_KEY:
+    raise RuntimeError("JWT_SECRET_KEY environment variable is required.")
 
-    # Calculate Debt - Credit Card: Expense adds debt, Refund/Payment subtract (also legacy Debit/Credit)
-    credit_data = conn.execute('''
-        SELECT transactions.type, SUM(transactions.amount) as total 
-        FROM transactions 
-        JOIN accounts ON transactions.account_id = accounts.id 
-        WHERE accounts.type = 'Credit Card' 
-        GROUP BY transactions.type
-    ''').fetchall()
-    debt_in = sum([row['total'] for row in credit_data if row['type'] in ('Expense', 'Debit')])
-    debt_out = sum([row['total'] for row in credit_data if row['type'] in ('Refund', 'Payment', 'Credit')])
-    total_debt = debt_in - debt_out
-    # Calculate Portfolio - fetch each ticker individually for reliable price
-    portfolio = conn.execute("SELECT * FROM portfolio").fetchall()
-    total_invested = 0.0
-    if portfolio:
-        for row in portfolio:
-            try:
-                data = yf.download(row['ticker'], period="1d", progress=False, auto_adjust=True)
-                if not data.empty and 'Close' in data.columns:
-                    price = float(data['Close'].iloc[-1])
-                else:
-                    info = yf.Ticker(row['ticker']).info
-                    price = info.get('regularMarketPrice') or info.get('previousClose') or row['avg_cost']
-                total_invested += price * row['shares']
-            except Exception:
-                total_invested += row['shares'] * row['avg_cost']
+Base.metadata.create_all(bind=engine)
 
-    net_worth = total_cash - total_debt + total_invested
-    accounts = conn.execute("SELECT * FROM accounts").fetchall()
-    conn.close()
+app = FastAPI(title="WealthManager API", version="2.0.0")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-    def fmt(v):
-        return f"{(v if v != 0 else 0):,.2f}"
-    return templates.TemplateResponse("dashboard.html", {
-        "request": request, "net_worth": fmt(net_worth), "total_cash": fmt(total_cash),
-        "total_debt": fmt(total_debt), "total_debt_abs": fmt(abs(total_debt)),
-        "total_invested": fmt(total_invested), "accounts": accounts,
-        "net_worth_val": net_worth, "total_cash_val": total_cash, "total_debt_val": total_debt, "total_invested_val": total_invested,
-        "chart_history": [net_worth * 0.9, net_worth * 0.95, net_worth * 0.98, net_worth * 1.02, net_worth]
-    })
+cors_origins_env = os.getenv("CORS_ALLOW_ORIGINS", "http://127.0.0.1:8080,http://localhost:8080")
+allowed_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# --- ACCOUNT ROUTES ---
-@app.post("/add_account")
-async def add_account(name: str = Form(...), type: str = Form(...)):
-    conn = get_db()
-    conn.execute("INSERT INTO accounts (name, type) VALUES (?, ?)", (name, type))
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/", status_code=303)
 
-@app.get("/account/{account_id}", response_class=HTMLResponse)
-async def view_account(request: Request, account_id: int):
-    conn = get_db()
-    account = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
-    txs = conn.execute("SELECT * FROM transactions WHERE account_id=? ORDER BY date DESC", (account_id,)).fetchall()
-    
-    # Calculate specific account balance
-    bal = 0.0
-    if account['type'] == 'Bank Account':
-        for tx in txs:
-            if tx['type'] in ('Debit', 'Deposit'): bal += tx['amount']
-            else: bal -= tx['amount']
-    else:  # Credit Card
-        for tx in txs:
-            if tx['type'] in ('Expense', 'Debit'): bal += tx['amount']
-            else: bal -= tx['amount']
-        
-    conn.close()
-    return templates.TemplateResponse("account.html", {"request": request, "account": account, "transactions": txs, "balance": f"{bal:,.2f}"})
+class Token(BaseModel):
+    access_token: str
+    token_type: str
 
-@app.post("/account/{account_id}/transaction")
-async def add_transaction(account_id: int, type: str = Form(...), amount: float = Form(...), description: str = Form(...)):
-    conn = get_db()
-    conn.execute("INSERT INTO transactions (account_id, date, type, amount, description) VALUES (?, ?, ?, ?, ?)", 
-                 (account_id, date.today().isoformat(), type, amount, description))
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url=f"/account/{account_id}", status_code=303)
 
-@app.post("/account/{account_id}/delete")
-async def delete_account(account_id: int):
-    conn = get_db()
-    conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
-    conn.execute("DELETE FROM transactions WHERE account_id=?", (account_id,))
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/", status_code=303)
+class TokenData(BaseModel):
+    sub: Optional[str] = None
 
-# --- PORTFOLIO ROUTES ---
-@app.get("/portfolio", response_class=HTMLResponse)
-async def view_portfolio(request: Request):
-    conn = get_db()
-    portfolio = conn.execute("SELECT * FROM portfolio").fetchall()
-    conn.close()
-    return templates.TemplateResponse("portfolio.html", {"request": request, "portfolio": portfolio})
 
-@app.post("/add_holding")
-async def add_holding(brokerage: str = Form(...), ticker: str = Form(...), shares: float = Form(...), avg_cost: float = Form(...)):
-    conn = get_db()
-    conn.execute("INSERT INTO portfolio (brokerage, ticker, shares, avg_cost) VALUES (?, ?, ?, ?)", 
-                 (brokerage, ticker.upper(), shares, avg_cost))
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/portfolio", status_code=303)
+class UserCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=100)
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
 
-@app.post("/portfolio/remove/{holding_id}")
-async def portfolio_remove(holding_id: int):
-    conn = get_db()
-    conn.execute("DELETE FROM portfolio WHERE id=?", (holding_id,))
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/portfolio", status_code=303)
 
-# --- PORTFOLIO EMULATOR ---
-@app.get("/emulator", response_class=HTMLResponse)
-async def emulator_page(request: Request):
-    conn = get_db()
-    holdings = conn.execute("SELECT * FROM emulator_holdings").fetchall()
-    conn.close()
-    return templates.TemplateResponse("emulator.html", {
-        "request": request, "holdings": [dict(h) for h in holdings],
-        "error": request.query_params.get("error", ""),
-        "error_ticker": request.query_params.get("ticker", "")
-    })
+class UserRead(BaseModel):
+    id: int
+    username: str
+    email: EmailStr
 
-def _is_valid_ticker(ticker: str) -> bool:
-    """Verify ticker exists in Yahoo Finance search (catches typos like mfst)."""
+
+class CategoryRead(BaseModel):
+    id: int
+    name: str
+
+
+class ExpenseCreate(BaseModel):
+    category_id: int
+    amount: float = Field(gt=0)
+    description: str = Field(min_length=1, max_length=255)
+    date: date
+
+
+class ExpenseRead(BaseModel):
+    id: int
+    category_id: int
+    category_name: str
+    amount: float
+    description: str
+    date: str
+
+
+def get_db() -> Generator[Session, None, None]:
+    db = SessionLocal()
     try:
-        search = yf.Search(ticker)
-        quotes = list(getattr(search, 'quotes', None) or [])
-        valid_symbols = {q.get('symbol', '').upper() for q in quotes if q.get('quoteType') in ('EQUITY', 'ETF', 'MUTUALFUND')}
-        return ticker.upper() in valid_symbols
-    except Exception:
-        return False
+        yield db
+    finally:
+        db.close()
 
-@app.post("/emulator/add")
-async def emulator_add(ticker: str = Form(...), shares: float = Form(...), avg_cost: float = Form(default=0.0)):
-    ticker = ticker.upper().strip()
-    if not ticker or len(ticker) < 2:
-        return RedirectResponse(url="/emulator?error=invalid_ticker&ticker=" + ticker, status_code=303)
-    if not _is_valid_ticker(ticker):
-        return RedirectResponse(url="/emulator?error=invalid_ticker&ticker=" + ticker, status_code=303)
-    use_fetched = avg_cost is None or avg_cost <= 0
-    if use_fetched:
-        avg_cost = 0
-        try:
-            data = yf.download(ticker, period="1d", progress=False, auto_adjust=True, threads=False)
-            if not data.empty:
-                last = data['Close'].iloc[-1]
-                avg_cost = round(float(last.squeeze()) if hasattr(last, 'squeeze') else float(last), 2)
-            if avg_cost <= 0:
-                info = yf.Ticker(ticker).info
-                avg_cost = float(info.get('regularMarketPrice') or info.get('previousClose') or 0)
-        except Exception:
-            pass
-    if avg_cost <= 0:
-        return RedirectResponse(url="/emulator?error=invalid_ticker&ticker=" + ticker, status_code=303)
-    conn = get_db()
-    conn.execute("INSERT INTO emulator_holdings (ticker, shares, avg_cost) VALUES (?, ?, ?)", 
-                 (ticker, shares, avg_cost))
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/emulator", status_code=303)
 
-@app.post("/emulator/remove/{holding_id}")
-async def emulator_remove(holding_id: int):
-    conn = get_db()
-    conn.execute("DELETE FROM emulator_holdings WHERE id=?", (holding_id,))
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/emulator", status_code=303)
+def create_access_token(subject: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {"sub": subject, "exp": expire}
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
-@app.post("/emulator/sell/{holding_id}")
-async def emulator_sell(holding_id: int, shares: float = Form(...)):
-    conn = get_db()
-    row = conn.execute("SELECT * FROM emulator_holdings WHERE id=?", (holding_id,)).fetchone()
-    if not row:
-        conn.close()
-        return RedirectResponse(url="/emulator", status_code=303)
-    new_shares = row['shares'] - shares
-    if new_shares <= 0:
-        conn.execute("DELETE FROM emulator_holdings WHERE id=?", (holding_id,))
-    else:
-        conn.execute("UPDATE emulator_holdings SET shares=? WHERE id=?", (new_shares, holding_id))
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/emulator", status_code=303)
 
-@app.get("/api/emulator/prices")
-async def api_emulator_prices():
-    conn = get_db()
-    holdings = conn.execute("SELECT * FROM emulator_holdings").fetchall()
-    conn.close()
-    tickers = list(set([h['ticker'] for h in holdings]))
-    result = {}
-    for t in tickers:
-        try:
-            data = yf.download(t, period="1d", progress=False, auto_adjust=True)
-            if not data.empty and 'Close' in data.columns:
-                result[t] = round(float(data['Close'].iloc[-1]), 2)
-            else:
-                row = next((h for h in holdings if h['ticker'] == t), None)
-                result[t] = row['avg_cost'] if row else 0
-        except Exception:
-            row = next((h for h in holdings if h['ticker'] == t), None)
-            result[t] = row['avg_cost'] if row else 0
-    holdings_data = []
-    for h in holdings:
-        price = result.get(h['ticker'], h['avg_cost'])
-        value = round(h['shares'] * price, 2)
-        cost_basis = round(h['shares'] * h['avg_cost'], 2)
-        gain_loss = round(value - cost_basis, 2)
-        holdings_data.append({
-            "id": h['id'], "ticker": h['ticker'], "shares": h['shares'], "avg_cost": h['avg_cost'],
-            "price": price, "value": value, "cost_basis": cost_basis, "gain_loss": gain_loss
-        })
-    total_value = sum(h["value"] for h in holdings_data)
-    total_cost = sum(h["cost_basis"] for h in holdings_data)
-    total_gain_loss = round(total_value - total_cost, 2)
-    return JSONResponse({"prices": result, "holdings": holdings_data, "total_gain_loss": total_gain_loss})
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
 
-@app.get("/api/emulator/search")
-async def api_emulator_search(q: str = ""):
-    """Ticker autocomplete - returns symbol, name for dropdown"""
-    q = (q or "").strip()
-    if len(q) < 1:
-        return JSONResponse({"results": []})
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def get_user_by_username(db: Session, username: str) -> Optional[User]:
+    return db.query(User).filter(User.username == username).first()
+
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    unauthorized = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid authentication credentials.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
     try:
-        search = yf.Search(q)
-        quotes = list(getattr(search, 'quotes', None) or [])
-        results = []
-        seen = set()
-        for item in quotes[:12]:
-            sym = (item.get('symbol') or '').upper()
-            if not sym or sym in seen:
-                continue
-            seen.add(sym)
-            name = item.get('shortname') or item.get('longname') or sym
-            qt = item.get('quoteType', '')
-            if qt in ('EQUITY', 'ETF', 'MUTUALFUND'):
-                results.append({"symbol": sym, "name": name})
-        return JSONResponse({"results": results[:10]})
-    except Exception:
-        return JSONResponse({"results": []})
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        token_data = TokenData(sub=payload.get("sub"))
+    except JWTError as exc:
+        raise unauthorized from exc
+    if not token_data.sub:
+        raise unauthorized
+    user = get_user_by_username(db, token_data.sub)
+    if not user:
+        raise unauthorized
+    return user
 
-@app.get("/api/emulator/history/{ticker}")
-async def api_emulator_history(ticker: str, period: str = "1mo"):
+
+def _resolve_san_file(filename: str) -> Path:
+    san_root = Path(SAN_MOUNT_PATH).resolve()
+    san_root.mkdir(parents=True, exist_ok=True)
+    file_path = (san_root / filename).resolve()
+    if san_root not in file_path.parents and file_path != san_root:
+        raise HTTPException(status_code=400, detail="Invalid SAN target path.")
+    return file_path
+
+
+def _seed_categories_if_empty(db: Session) -> None:
+    if db.query(Category).count() > 0:
+        return
+    defaults = ["Food", "Rent", "Utilities", "Transport", "Healthcare", "Entertainment", "Miscellaneous"]
+    for name in defaults:
+        db.add(Category(name=name))
+    db.commit()
+
+
+@app.get("/health")
+def healthcheck() -> dict:
+    return {"status": "ok"}
+
+
+@app.get("/")
+def root() -> dict:
+    return {
+        "service": "WealthManager API",
+        "status": "online",
+        "health_endpoint": "/health",
+        "openapi_docs": "/docs",
+    }
+
+
+@app.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+def register(payload: UserCreate, db: Session = Depends(get_db)) -> UserRead:
+    user = User(
+        username=payload.username.strip(),
+        email=payload.email.lower().strip(),
+        hashed_password=get_password_hash(payload.password),
+    )
+    db.add(user)
     try:
-        t = yf.Ticker(ticker.upper())
-        hist = t.history(period=period)
-        if hist.empty:
-            return JSONResponse({"labels": [], "data": []})
-        hist = hist.reset_index()
-        labels = [d.strftime("%Y-%m-%d") for d in hist['Date']]
-        data = [round(float(p), 2) for p in hist['Close']]
-        return JSONResponse({"labels": labels, "data": data})
-    except Exception:
-        return JSONResponse({"labels": [], "data": []})
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Username or email already exists.") from exc
+    db.refresh(user)
+    return UserRead(id=user.id, username=user.username, email=user.email)
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+
+@app.post("/token", response_model=Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)) -> Token:
+    user = get_user_by_username(db, form_data.username)
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Incorrect username or password.")
+    access_token = create_access_token(subject=user.username)
+    return Token(access_token=access_token, token_type="bearer")
+
+
+@app.get("/users/me", response_model=UserRead)
+def read_current_user(current_user: User = Depends(get_current_user)) -> UserRead:
+    return UserRead(id=current_user.id, username=current_user.username, email=current_user.email)
+
+
+@app.get("/categories", response_model=list[CategoryRead])
+def list_categories(db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> list[CategoryRead]:
+    _seed_categories_if_empty(db)
+    categories = db.query(Category).order_by(Category.name.asc()).all()
+    return [CategoryRead(id=c.id, name=c.name) for c in categories]
+
+
+@app.get("/expenses", response_model=list[ExpenseRead])
+def list_expenses(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> list[ExpenseRead]:
+    expenses = (
+        db.query(Expense, Category)
+        .join(Category, Expense.category_id == Category.id)
+        .filter(Expense.user_id == current_user.id)
+        .order_by(Expense.date.desc(), Expense.id.desc())
+        .all()
+    )
+    return [
+        ExpenseRead(
+            id=expense.id,
+            category_id=expense.category_id,
+            category_name=category.name,
+            amount=expense.amount,
+            description=expense.description,
+            date=expense.date.date().isoformat(),
+        )
+        for expense, category in expenses
+    ]
+
+
+@app.post("/expenses", response_model=ExpenseRead, status_code=status.HTTP_201_CREATED)
+def create_expense(
+    payload: ExpenseCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ExpenseRead:
+    category = db.query(Category).filter(Category.id == payload.category_id).first()
+    if not category:
+        raise HTTPException(status_code=400, detail="Invalid category.")
+
+    expense = Expense(
+        user_id=current_user.id,
+        category_id=payload.category_id,
+        amount=payload.amount,
+        date=datetime.combine(payload.date, datetime.min.time(), tzinfo=timezone.utc),
+        description=payload.description.strip(),
+    )
+    db.add(expense)
+    db.commit()
+    db.refresh(expense)
+
+    return ExpenseRead(
+        id=expense.id,
+        category_id=expense.category_id,
+        category_name=category.name,
+        amount=expense.amount,
+        description=expense.description,
+        date=expense.date.date().isoformat(),
+    )
+
+
+@app.delete("/expenses/{expense_id}")
+def delete_expense(expense_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> dict:
+    expense = db.query(Expense).filter(Expense.id == expense_id, Expense.user_id == current_user.id).first()
+    if not expense:
+        raise HTTPException(status_code=404, detail="Expense not found.")
+    db.delete(expense)
+    db.commit()
+    return {"deleted": True, "expense_id": expense_id}
+
+
+@app.get("/expenses/summary")
+def expenses_summary(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> dict:
+    now = datetime.now(timezone.utc)
+    month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+
+    monthly_total = (
+        db.query(func.coalesce(func.sum(Expense.amount), 0.0))
+        .filter(Expense.user_id == current_user.id, Expense.date >= month_start)
+        .scalar()
+    )
+
+    grouped = (
+        db.query(Category.name, func.coalesce(func.sum(Expense.amount), 0.0).label("total"))
+        .join(Expense, Expense.category_id == Category.id)
+        .filter(Expense.user_id == current_user.id, Expense.date >= month_start)
+        .group_by(Category.name)
+        .order_by(func.sum(Expense.amount).desc())
+        .all()
+    )
+
+    return {
+        "month": month_start.date().isoformat(),
+        "total_spent_this_month": round(float(monthly_total or 0.0), 2),
+        "by_category": [{"category": name, "total": round(float(total), 2)} for name, total in grouped],
+    }
+
+
+@app.post("/expenses/export")
+def export_expenses_to_san(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> dict:
+    export_path = _resolve_san_file(f"expenses_user_{current_user.id}.csv")
+    rows = (
+        db.query(Expense, Category)
+        .join(Category, Expense.category_id == Category.id)
+        .filter(Expense.user_id == current_user.id)
+        .order_by(Expense.date.desc())
+        .all()
+    )
+    with export_path.open("w", newline="", encoding="utf-8") as handle:
+        import csv
+        writer = csv.writer(handle)
+        writer.writerow(["id", "date", "category", "amount", "description"])
+        for expense, category in rows:
+            writer.writerow([expense.id, expense.date.date().isoformat(), category.name, expense.amount, expense.description])
+    return {"message": "Expenses exported to SAN.", "path": str(export_path)}
