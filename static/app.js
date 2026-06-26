@@ -17,14 +17,13 @@ const loginForm = document.getElementById("login-form");
 const registerForm = document.getElementById("register-form");
 const expenseForm = document.getElementById("expense-form");
 const logoutBtn = document.getElementById("logout-btn");
-const apiInput = document.getElementById("api-base-input");
-const saveApiBtn = document.getElementById("save-api-btn");
+
 const categorySelect = document.getElementById("category-select");
 const expensesTbody = document.getElementById("expenses-tbody");
 const totalMonth = document.getElementById("total-month");
 const categoryBars = document.getElementById("category-bars");
 
-apiInput.value = state.apiBase;
+
 expenseForm.elements.date.valueAsDate = new Date();
 
 function setToken(token) {
@@ -229,10 +228,7 @@ logoutBtn.addEventListener("click", () => {
   renderAuth();
 });
 
-saveApiBtn.addEventListener("click", () => {
-  setApi(apiInput.value);
-  showAuth(`API saved: ${state.apiBase}`);
-});
+
 
 (async () => {
   if (!state.token) return renderAuth();
