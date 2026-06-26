@@ -1,10 +1,11 @@
-const DEFAULT_API = "http://10.1.104.100";
+// Hardcode the API to point to your Nginx Load Balancer
+const DEFAULT_API = "http://10.1.104.100/api"; 
 const TOKEN_KEY = "wm.jwt";
-const API_KEY = "wm.api";
+// Remove API_KEY constant and all references to it
 
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || "",
-  apiBase: localStorage.getItem(API_KEY) || DEFAULT_API,
+  apiBase: DEFAULT_API, // No longer stored in localStorage
   categories: [],
 };
 
