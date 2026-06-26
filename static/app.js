@@ -1,4 +1,4 @@
-const DEFAULT_API = "http://127.0.0.1:8001";
+const DEFAULT_API = "http://10.1.104.100";
 const TOKEN_KEY = "wm.jwt";
 const API_KEY = "wm.api";
 
